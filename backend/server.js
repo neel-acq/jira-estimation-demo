@@ -465,9 +465,12 @@ app.get("/api/jira/issuetypes-summary", async (req, res) => {
     issues.forEach((issue) => {
       const issueType = issue.fields?.issuetype;
       if (!issueType || !issueType.id) return;
-
       const estSeconds =
-        issue.fields?.timetracking?.timeSpentSeconds ||
+        issue.fields?.timetracking?.originalEstimateSeconds ||
+        parseJiraEstimateToSeconds(
+          issue.fields?.timetracking?.originalEstimate
+        ) ||
+        issue.fields?.timeoriginalestimate ||
         issue.fields?.timeestimate ||
         0;
       const hours = estSeconds / 3600;
@@ -858,6 +861,23 @@ function secondsToJiraEstimate(seconds) {
   return parts.join(" ");
 }
 
+// Parse Jira estimate strings like "2h 30m" into seconds
+function parseJiraEstimateToSeconds(value) {
+  if (value == null) return 0;
+  if (typeof value === "number" && isFinite(value)) return Math.max(0, Math.round(value));
+  if (typeof value !== "string") return 0;
+  const text = value.trim().toLowerCase();
+  if (!text) return 0;
+  let total = 0;
+  const hourMatch = text.match(/(\d+)\s*h/);
+  const minuteMatch = text.match(/(\d+)\s*m/);
+  if (hourMatch) total += parseInt(hourMatch[1], 10) * 3600;
+  if (minuteMatch) total += parseInt(minuteMatch[1], 10) * 60;
+  // If plain number provided without units, treat as hours
+  if (total === 0 && /^\d+$/.test(text)) total = parseInt(text, 10) * 3600;
+  return total;
+}
+
 app.put("/api/jira/estimate-by-type", async (req, res) => {
   const token = req.headers.authorization?.split(" ")[1];
   if (!token) return res.status(400).json({ error: "Missing token" });
@@ -867,10 +887,15 @@ app.put("/api/jira/estimate-by-type", async (req, res) => {
   if (!issueTypeName)
     return res.status(400).json({ error: "Missing issueTypeName" });
 
-  const secondsFinal = seconds
-    ? Math.max(0, Math.round(seconds))
-    : Math.max(0, Math.round(hours * 3600));
-  const originalEstimate = secondsToJiraEstimate(secondsFinal);
+  const secondsFinalRaw =
+    seconds != null && isFinite(Number(seconds))
+      ? Math.round(Number(seconds))
+      : hours != null && isFinite(Number(hours))
+      ? Math.round(Number(hours) * 3600)
+      : NaN;
+  if (!isFinite(secondsFinalRaw) || secondsFinalRaw < 0)
+    return res.status(400).json({ error: "Provide valid 'hours' or 'seconds' >= 0" });
+  const secondsFinal = secondsFinalRaw;
 
   try {
     const searchRes = await fetch(
@@ -893,11 +918,26 @@ app.put("/api/jira/estimate-by-type", async (req, res) => {
     const searchData = await searchRes.json();
     if (!searchRes.ok) return res.status(searchRes.status).json(searchData);
     const issues = searchData.issues || [];
+    const issueCount = issues.length;
+    if (issueCount === 0)
+      return res.json({ updated: 0, perIssueSeconds: 0, results: [] });
+
+    // Divide total seconds equally across all issues (distribute remainder)
+    const baseSeconds = Math.floor(secondsFinal / issueCount);
+    let remainder = secondsFinal - baseSeconds * issueCount;
 
     const results = [];
+    let index = 0;
     for (const issue of issues) {
       const key = issue.key;
+      let success = false;
+      let error = null;
+      const assignedSeconds = baseSeconds + (remainder > 0 ? 1 : 0);
+      if (remainder > 0) remainder -= 1;
+      const originalEstimatePerIssue = secondsToJiraEstimate(assignedSeconds);
+
       try {
+        // Try timetracking first (preferred method with both string and seconds)
         const updateRes = await fetch(
           `https://api.atlassian.com/ex/jira/${CLOUD_ID}/rest/api/3/issue/${encodeURIComponent(
             key
@@ -912,20 +952,111 @@ app.put("/api/jira/estimate-by-type", async (req, res) => {
             body: JSON.stringify({
               fields: {
                 timetracking: {
-                  originalEstimate,
+                  originalEstimate: originalEstimatePerIssue,
+                  originalEstimateSeconds: assignedSeconds,
                 },
               },
             }),
           }
         );
 
-        if (!updateRes.ok) {
-          const text = await updateRes.text();
-          console.error("Failed to update issue:", text);
-          results.push({ key, success: false, error: text });
+        if (updateRes.ok) {
+          console.log("Issue updated successfully via timetracking:", key);
+          results.push({ key, success: true, method: "timetracking", seconds: assignedSeconds });
+          success = true;
         } else {
-          console.log("Issue updated successfully:", key);
-          results.push({ key, success: true });
+          const text = await updateRes.text();
+          let errorData;
+          try {
+            errorData = JSON.parse(text);
+          } catch {
+            errorData = { error: text };
+          }
+
+          // Check if the error is specifically about timetracking field not being editable
+          const isTimetrackingError =
+            errorData.errors?.timetracking ||
+            (typeof text === "string" &&
+              (text.includes("timetracking") ||
+                text.includes("not on the appropriate screen")));
+
+          if (isTimetrackingError) {
+            // Fallback: Try using timeoriginalestimate field directly
+            console.log(
+              `Timetracking field not available for ${key}, trying timeoriginalestimate fallback...`
+            );
+            const fallbackRes = await fetch(
+              `https://api.atlassian.com/ex/jira/${CLOUD_ID}/rest/api/3/issue/${encodeURIComponent(
+                key
+              )}`,
+              {
+                method: "PUT",
+                headers: {
+                  Authorization: `Bearer ${token}`,
+                  Accept: "application/json",
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  fields: {
+                    timeoriginalestimate: assignedSeconds,
+                  },
+                }),
+              }
+            );
+
+            if (fallbackRes.ok) {
+              console.log(
+                "Issue updated successfully via timeoriginalestimate:",
+                key
+              );
+              results.push({
+                key,
+                success: true,
+                method: "timeoriginalestimate",
+                seconds: assignedSeconds,
+              });
+              success = true;
+            } else {
+              const fallbackText = await fallbackRes.text();
+              let fallbackErrorData;
+              try {
+                fallbackErrorData = JSON.parse(fallbackText);
+              } catch {
+                fallbackErrorData = { error: fallbackText };
+              }
+
+              const isTimeoriginalestimateError =
+                fallbackErrorData.errors?.timeoriginalestimate ||
+                (typeof fallbackText === "string" &&
+                  (fallbackText.includes("timeoriginalestimate") ||
+                    fallbackText.includes("not on the appropriate screen")));
+
+              if (isTimeoriginalestimateError) {
+                error =
+                  "Time tracking fields are not configured on the issue screen. To fix this:\n1. Go to Jira Settings > Issues > Screens\n2. Edit the screen used by this issue type\n3. Add the 'Time Tracking' field to the screen\n4. Save the changes";
+              } else {
+                error = fallbackText;
+              }
+              console.error(
+                `Failed to update issue ${key} via fallback:`,
+                fallbackText
+              );
+            }
+          } else {
+            // Other error, not related to timetracking field
+            console.error(`Failed to update issue ${key}:`, text);
+            error = text;
+          }
+        }
+
+        if (!success) {
+          results.push({
+            key,
+            success: false,
+            error:
+              error ||
+              "Unknown error - time tracking fields not available on screen",
+          });
         }
       } catch (err) {
         console.error("Error updating issue:", err);
@@ -934,6 +1065,31 @@ app.put("/api/jira/estimate-by-type", async (req, res) => {
     }
     const successCount = results.filter((r) => r.success).length;
     console.log(`✅ Updated ${successCount}/${results.length} issues`);
+
+    // If all failed and the common reason is missing time tracking on screen, return 422 with concise message
+    if (successCount === 0) {
+      const missingKeys = results
+        .filter(
+          (r) =>
+            !r.success &&
+            typeof r.error === "string" &&
+            r.error.includes("Time tracking fields are not configured")
+        )
+        .map((r) => r.key);
+
+      if (missingKeys.length > 0) {
+        const message =
+          `Time tracking fields are not configured on the issue screen. Add 'Time Tracking' to the screen for this issue type in project ${projectKey}. Affected issues: ${missingKeys.join(", ")}`;
+        return res.status(422).json({
+          error: message,
+          projectKey,
+          issueTypeName,
+          keys: missingKeys,
+          results,
+        });
+      }
+    }
+
     res.json({ updated: results.length, results });
   } catch (err) {
     console.error("Error bulk updating estimates by type:", err);
