@@ -43,6 +43,8 @@ const OAuthCallback: React.FC = () => {
   const [editDescription, setEditDescription] = useState("");
 
   const [codeExchanged, setCodeExchanged] = useState(false);
+  // webhook creation input
+  const [webhookUrlInput, setWebhookUrlInput] = useState<string>("");
 
   useEffect(() => {
     // Try to restore token from storage first so refresh keeps session
@@ -229,7 +231,7 @@ const OAuthCallback: React.FC = () => {
         toast.success("Issue type deleted successfully!");
       } else {
         console.error("Error deleting issue type:", data);
-        toast.error(data?.error || "Failed to delete issue type.");
+        toast.error(data?.errorMessages?.[0] || "Failed to delete issue type.");
       }
     } catch (err) {
       console.error(err);
@@ -393,6 +395,42 @@ const OAuthCallback: React.FC = () => {
     } catch (err) {
       console.error("Error updating hours:", err);
       toast.error("Error updating hours.");
+    }
+  };
+
+  // Create Jira webhook (backend proxies to Jira)
+  const createJiraWebhook = async () => {
+    if (!accessToken) {
+      toast.error("No access token.");
+      return;
+    }
+    const url = webhookUrlInput.trim();
+    if (!url) {
+      toast.error("Enter a public webhook URL.");
+      return;
+    }
+    try {
+      const res = await fetch(`${baseUrl}/api/jira/webhooks`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          webhookUrl: url,
+          projectKey: selectedProjectKey || undefined,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        console.error("Create webhook error", data);
+        toast.error(data?.error || "Failed to create webhook.");
+        return;
+      }
+      toast.success("Webhook created successfully.");
+    } catch (err) {
+      console.error("Error creating webhook:", err);
+      toast.error("Error creating webhook.");
     }
   };
 
@@ -719,6 +757,26 @@ const OAuthCallback: React.FC = () => {
               </div>
             </div>
           </div>
+        </div>
+      </section>
+      {/* Webhook creator - centered at end */}
+      <section className="section">
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
+          <h3>Create Jira Webhook</h3>
+          <input
+            style={{ width: "60%", maxWidth: 600 }}
+            placeholder="Public webhook URL (e.g. https://your-ngrok-domain/webhook)"
+            value={webhookUrlInput}
+            onChange={(e) => setWebhookUrlInput(e.target.value)}
+          />
+          <button
+            className="button button-primary"
+            onClick={createJiraWebhook}
+            disabled={!accessToken}
+            style={{ alignSelf: "center" }}
+          >
+            Create Webhook
+          </button>
         </div>
       </section>
     </div>

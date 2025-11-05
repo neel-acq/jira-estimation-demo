@@ -284,12 +284,13 @@ async function manageIssueTypeAndScheme(
 
 // await manageIssueTypeAndScheme(Token, cloudID);
 
-// Get projects
+// Get projects (only company-managed)
 app.get("/api/jira/projects", async (req, res) => {
   const token = req.headers.authorization?.split(" ")[1];
   if (!token) return res.status(400).json({ error: "Missing token" });
 
   try {
+    // Step 1: Fetch all projects
     const projectsRes = await fetch(
       `https://api.atlassian.com/ex/jira/${CLOUD_ID}/rest/api/3/project/search`,
       {
@@ -300,11 +301,16 @@ app.get("/api/jira/projects", async (req, res) => {
       }
     );
     const data = await projectsRes.json();
-    const projects = data.values || [];
+    const allProjects = data.values || [];
 
-    // Fetch issue count for each project (parallel)
+    // Step 2: Filter to include only company-managed projects
+    const companyManagedProjects = allProjects.filter(
+      (proj) => proj.simplified === false // simplified=true → team-managed
+    );
+
+    // Step 3: Fetch issue count for each project (parallel)
     const projectsWithCount = await Promise.all(
-      projects.map(async (proj) => {
+      companyManagedProjects.map(async (proj) => {
         try {
           const searchRes = await fetch(
             `https://api.atlassian.com/ex/jira/${CLOUD_ID}/rest/api/3/search/jql`,
@@ -325,22 +331,24 @@ app.get("/api/jira/projects", async (req, res) => {
           const searchData = await searchRes.json();
           const total =
             typeof searchData.total === "number" ? searchData.total : 0;
-          return { ...proj, issueCount: total };
+          return { ...proj, issueCount: total, projectStyle: "company-managed" };
         } catch (err) {
           console.error(
             `Failed to fetch issue count for project ${proj.key}:`,
             err
           );
-          return { ...proj, issueCount: null };
+          return { ...proj, issueCount: null, projectStyle: "company-managed" };
         }
       })
     );
+
     res.json(projectsWithCount);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to fetch projects" });
   }
 });
+
 
 // Health endpoint for quick status checks
 app.get("/health", (req, res) => {
@@ -864,7 +872,8 @@ function secondsToJiraEstimate(seconds) {
 // Parse Jira estimate strings like "2h 30m" into seconds
 function parseJiraEstimateToSeconds(value) {
   if (value == null) return 0;
-  if (typeof value === "number" && isFinite(value)) return Math.max(0, Math.round(value));
+  if (typeof value === "number" && isFinite(value))
+    return Math.max(0, Math.round(value));
   if (typeof value !== "string") return 0;
   const text = value.trim().toLowerCase();
   if (!text) return 0;
@@ -894,7 +903,9 @@ app.put("/api/jira/estimate-by-type", async (req, res) => {
       ? Math.round(Number(hours) * 3600)
       : NaN;
   if (!isFinite(secondsFinalRaw) || secondsFinalRaw < 0)
-    return res.status(400).json({ error: "Provide valid 'hours' or 'seconds' >= 0" });
+    return res
+      .status(400)
+      .json({ error: "Provide valid 'hours' or 'seconds' >= 0" });
   const secondsFinal = secondsFinalRaw;
 
   try {
@@ -962,7 +973,12 @@ app.put("/api/jira/estimate-by-type", async (req, res) => {
 
         if (updateRes.ok) {
           console.log("Issue updated successfully via timetracking:", key);
-          results.push({ key, success: true, method: "timetracking", seconds: assignedSeconds });
+          results.push({
+            key,
+            success: true,
+            method: "timetracking",
+            seconds: assignedSeconds,
+          });
           success = true;
         } else {
           const text = await updateRes.text();
@@ -1078,8 +1094,9 @@ app.put("/api/jira/estimate-by-type", async (req, res) => {
         .map((r) => r.key);
 
       if (missingKeys.length > 0) {
-        const message =
-          `Time tracking fields are not configured on the issue screen. Add 'Time Tracking' to the screen for this issue type in project ${projectKey}. Affected issues: ${missingKeys.join(", ")}`;
+        const message = `Time tracking fields are not configured on the issue screen. Add 'Time Tracking' to the screen for this issue type in project ${projectKey}. Affected issues: ${missingKeys.join(
+          ", "
+        )}`;
         return res.status(422).json({
           error: message,
           projectKey,
@@ -1097,22 +1114,120 @@ app.put("/api/jira/estimate-by-type", async (req, res) => {
   }
 });
 
-// manage for webhook request
-app.post("/api/jira/webhook", async (req, res) => {
-  const { event, issue } = req.body;
-  console.log(event, issue);
-  // if event is issue_updated, then update the issue in the database
-  if (event === "issue_updated") {
-    const { id, fields } = issue;
-    const { summary, description } = fields;
-    const issue = await Issue.findByIdAndUpdate(
-      id,
-      { summary, description },
-      { new: true }
+// Create Jira Webhook Dynamically
+app.post("/api/jira/webhooks", async (req, res) => {
+  const token = req.headers.authorization?.split(" ")[1];
+  const {
+    cloudId = CLOUD_ID, // Jira Cloud ID
+    webhookUrl, // Your webhook receiver endpoint (REQUIRED at top-level per Jira API)
+    name = "Issue Events Webhook",
+    events = ["jira:issue_created", "jira:issue_updated", "jira:issue_deleted"],
+    projectKey, // Optional: restrict events to one project via JQL
+    fieldIdsFilter, // Optional: array of field ids
+    issuePropertyKeysFilter, // Optional: array of property keys
+  } = req.body;
+
+  // ---- Validation ----
+  if (!token) return res.status(400).json({ error: "Missing token" });
+  if (!webhookUrl) return res.status(400).json({ error: "Missing webhookUrl" });
+
+  try {
+    // ---- Payload (matches Atlassian spec exactly) ----
+    const webhookDetails = {
+      events,
+      ...(projectKey ? { jqlFilter: `project = ${projectKey}` } : {}),
+      ...(Array.isArray(fieldIdsFilter) ? { fieldIdsFilter } : {}),
+      ...(Array.isArray(issuePropertyKeysFilter)
+        ? { issuePropertyKeysFilter }
+        : {}),
+    };
+
+    const bodyData = {
+      url: webhookUrl, // REQUIRED top-level property
+      webhooks: [webhookDetails],
+    };
+
+    // ---- API Request ----
+    const webhookRes = await fetch(
+      `https://api.atlassian.com/ex/jira/${cloudId}/rest/api/3/webhook`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(bodyData),
+      }
     );
-    console.log(issue);
+
+    const text = await webhookRes.text();
+    let data;
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = { message: text };
+    }
+
+    // ---- Error Handling ----
+    if (!webhookRes.ok) {
+      console.error("Failed to create webhook:", data);
+      return res.status(webhookRes.status).json({
+        error: "Failed to create webhook",
+        details: data,
+      });
+    }
+
+    // ---- Success ----
+    return res.json({
+      success: true,
+      message: "Webhook created successfully",
+      created: data,
+    });
+  } catch (err) {
+    console.error("Error creating Jira webhook:", err);
+    return res.status(500).json({ error: "Failed to create webhook" });
   }
-  res.json({ success: true });
+});
+
+// Receive incoming Jira webhooks
+app.post("/api/jira/recive-webhooks", async (req, res) => {
+  try {
+    console.log("🔔 Received Jira Webhook Event");
+
+    const eventType =
+      req.headers["x-atlassian-webhook-identifier"] || "unknown";
+    const payload = req.body;
+
+    console.log("Event Type:", eventType);
+    console.log("Webhook Payload:", JSON.stringify(payload, null, 2));
+
+    // --- Example: Handle issue creation event ---
+    if (payload?.issue_event_type_name === "issue_created") {
+      const issue = payload.issue;
+      const project = issue.fields.project;
+      console.log(
+        `🆕 Issue Created in ${project.key}: ${issue.key} - ${issue.fields.summary}`
+      );
+      // You can store this in DB, notify Slack, etc.
+    }
+
+    // --- Example: Handle issue update ---
+    if (payload?.issue_event_type_name === "issue_updated") {
+      console.log(`♻️ Issue Updated: ${payload.issue.key}`);
+    }
+
+    // --- Example: Handle issue delete ---
+    if (payload?.issue_event_type_name === "issue_deleted") {
+      console.log(`🗑️ Issue Deleted: ${payload.issue.key}`);
+    }
+
+    // Always respond 200 to Jira so it doesn’t disable the webhook
+    res.status(200).json({ received: true });
+  } catch (err) {
+    console.error("Error processing webhook:", err);
+    res.status(500).json({ error: "Error processing webhook" });
+  }
 });
 
 // ====================================================================================================
